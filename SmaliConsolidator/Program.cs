@@ -107,6 +107,11 @@ namespace SmaliConsolidator
                                 string lineId = line.Substring(line.LastIndexOf(" "));
                                 string lineType = line.Substring(0, line.IndexOf(" "));
                                 int index = lineIds.IndexOf(lineId);
+                                if(lineType == ".super" || lineType == ".source" || lineType == ".class")
+                                {
+                                    continue;
+                                }
+
                                 if (lineType == ".end" && newLines)
                                 {
                                     toWrite += line + "\n\n";
@@ -133,9 +138,12 @@ namespace SmaliConsolidator
 
                     File.AppendAllText(relativeFile, toWrite);
 
-                    Console.WriteLine();
-                    Console.WriteLine(relativeFile);
-                    Console.WriteLine(lineCount + " lines added! (excluding whitelines)");
+                    if (lineCount > 0)
+                    {
+                        Console.WriteLine();
+                        Console.WriteLine(relativeFile);
+                        Console.WriteLine(lineCount + " lines added! (excluding whitelines)");
+                    }
                 }
                 else
                 {
