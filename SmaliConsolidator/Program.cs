@@ -1,14 +1,28 @@
 ﻿using System;
+using System.Text;
 
 namespace SmaliConsolidator
 {
     internal class Program
     {
+        private static List<string> possibleRegisters;
+
         static void Main(string[] args)
         {
+            possibleRegisters = GeneratePossibleRegisters(256);
             List<string> files = GetFolderFiles();
 
             ConsolidateFiles(files);
+        }
+
+        private static List<string> GeneratePossibleRegisters(int maxRegisters)
+        {
+            List<string> returnList = new List<string>();
+            for(int i = 0; i < maxRegisters; i++)
+            {
+                returnList.Add("v" + i);
+            }
+            return returnList;
         }
 
         private static List<string> GetFolderFiles()
@@ -67,7 +81,7 @@ namespace SmaliConsolidator
             }
 
             bool skip = true;
-            foreach (string file in files)
+            foreach (string readFromFilePath in files)
             {
                 if (skip)
                 {
@@ -75,113 +89,181 @@ namespace SmaliConsolidator
                     continue;
                 }
 
-                // Get all the relevant data in the file to write to
-                string relativeFile = targetFolder + file.Replace(files[0], "");
-                if (File.Exists(relativeFile))
+                string writeToFilePath = targetFolder + readFromFilePath.Replace(files[0], "");
+                if (File.Exists(writeToFilePath))
                 {
-                    List<string> lineIds = new List<string>();
-                    List<string> lineTypes = new List<string>();
-                    foreach (string line in File.ReadLines(relativeFile))
+                    List<Element> writeToElements = GetElementsFromFile(writeToFilePath);
+                    List<Element> readFromElements = GetElementsFromFile(readFromFilePath);
+
+                    // Setup static variable to replace readFromFile .super
+                    bool mixedSuper = false;
+                    string currentObjectType = "";
+                    string objectType = "";
+                    string staticVarName = "";
+                    Element? writeToSuper = writeToElements.Find(x => x.Type == "super");
+                    Element? readFromSuper = readFromElements.Find(x => x.Type == "super");
+                    if(writeToSuper != null && readFromSuper != null && writeToSuper.Identifier != readFromSuper.Identifier)
                     {
-                        if(line.Length > 0 && line[0] == '.')
+                        mixedSuper = true;
+
+                        List<string> variableNames = new List<string>();
+                        variableNames.AddRange(GetVariableNamesFromElements(readFromElements));
+                        variableNames.AddRange(GetVariableNamesFromElements(writeToElements));
+
+                        while (true)
                         {
-                            string lineType = line.Substring(0, line.IndexOf(" "));
-                            if(lineType != ".end")
+                            staticVarName = GenerateRandomString(5);
+                            if(!variableNames.Contains(staticVarName))
                             {
-                                string lineId = line.Substring(line.LastIndexOf(" "));
-                                lineIds.Add(lineId);
-                                lineTypes.Add(lineType);
+                                break;
+                            }
+                        }
+
+                        // Add static variable field
+                        objectType = readFromSuper.Identifier.Substring(readFromSuper.Identifier.IndexOf("L"), readFromSuper.Identifier.LastIndexOf(";"));
+                        Element staticElement = new Element(".field private static " + staticVarName + ":" + objectType);
+
+                        Element? clinit = writeToElements.Find(x => x.Type == "method" && x.Identifier.Contains("<clinit>"));
+                        if(clinit == null)
+                        {
+                            clinit = readFromElements.Find(x => x.Type == "method" && x.Identifier.Contains("<clinit>"));
+                            if(clinit != null)
+                            {
+                                readFromElements.Remove(clinit);
+                            }
+                        }
+                        else
+                        {
+                            writeToElements.Remove(clinit);
+                        }
+
+                        Element? classElement = writeToElements.Find(x => x.Type == "class");
+                        if (classElement != null)
+                        {
+                            // TODO - There is this weirdness here
+                            // Normally the new-instance has to first get its <init> called before being sput-object into a variable
+                            // However, <init> is often called within functions
+                            // Add the <init> here in the <clinit>, and remove any lines that call <init> in a later function on the static variable
+
+                            currentObjectType = classElement.Identifier.Trim();
+                            if (clinit == null)
+                            {
+                                Element newClinit = new Element(".method static constructor <clinit>()V");
+                                newClinit.AddLine("    .locals 1");
+                                newClinit.AddLine("    new-instance v0, " + objectType);
+                                newClinit.AddLine("    sput-object v0, " + currentObjectType + "->" + staticVarName + ":" + objectType);
+                                newClinit.AddLine(".end method");
+                                writeToElements.Add(newClinit);
+                            }
+                            else
+                            {
+                                // TODO - Change already existing .locals here
+                                clinit.AddLine("    new-instance v0, " + objectType);
+                                clinit.AddLine("    sput-object v0, " + currentObjectType + "->" + staticVarName + ":" + objectType);
+                                writeToElements.Add(clinit);
                             }
                         }
                     }
 
-                    bool newLines = false;
-
-                    // Go through the file to read from and if a line that isn't in the other file is found, mark it to be added to the file to write to
-                    int lineCount = 0;
-                    string toWrite = "\n";
-                    foreach (string line in File.ReadLines(file))
+                    // Add elements from readFromFile to writeToFile
+                    foreach (Element element in readFromElements)
                     {
-                        if (line.Length > 0)
+                        if(element.Type != "super" && element.Type != "class" && element.Type != "source" && writeToElements.Find(x => x.Type == element.Type && x.Identifier == element.Identifier) == null)
                         {
-                            if (line[0] == '.')
+                            if(element.Type == "method" && mixedSuper)
                             {
-                                /* Check for a .super and if it's found check if it's different than the one in the lineIds
-                                   If it's different store that value and replace any references to it with the right calls (if it's the same just ignore it)
-                                   Also, if it's found, you need to add the initialization code for the static variable to the <clinit> code
-                                   This way it is guaranteed to be initialized when needed to be used later
-
-                                    Put this in <clinit>:
-                                    .field private static <varName>:ObjectType
-                                    new-instance <register>, ObjectType
-                                    sput-object <register>, ThisObjectType;-><varName>
-
-                                    Make sure the chosen varName isn't already taken by another variable. Use the lineIds and lineTypes (.field) to check this
-                                    Also, this applies to any register use anywhere, but make sure the register used is not already being used. Otherwise values may be overwritten that need to be used later
-                                    Keep a list of registers while going through a function. Keep a constant list of registers that can be used. When needing a register pick the first register in the constant list that isn't in the other list
-                                    
-                                    Replace any function calls to the previous super with the sget and either the invoke-direct or the invoke-virtual
-                                    invoke-direct can be replaced with invoke-direct and invoke-virtual can be replaced with invoke-virtual
-                                    invoke-static doesn't need to be replaced
-                                    The reason for this is that invoke-direct is used for constructors (or private functions but that's not relevant for us as you can't use private functions when inheriting anyway)
-                                    invoke-static is used exclusively for static functions (which don't need a reference to the static object we initialized so we can keep it as is)
-                                    and invoke-virtual is used for all others, so these all need to be replaced as the inherited public functions aren't accessible anymore
-
-                                    sget-object <register>, ThisObjectType;-><varName>
-                                    invoke-direct {<register>}, ObjectType;->Function
-                                    invoke-virtual {<register>}, ObjectType;->Function
-
-                                    If there is no <clinit>, add it. It may not always be present.
-                                    .method static constructor <clinit>()V
-                                        Initialize static stuff
-                                        return-void
-                                    .end method
-                                 */
-
-                                string lineId = line.Substring(line.LastIndexOf(" "));
-                                string lineType = line.Substring(0, line.IndexOf(" "));
-                                int index = lineIds.IndexOf(lineId);
-                                if(lineType == ".source" || lineType == ".class")
+                                List<string>? usedRegisters = null;
+                                foreach (string line in element.GetLines())
                                 {
-                                    continue;
-                                }
+                                    string trimLine = line.Trim();
+                                    int spaceIndex = trimLine.IndexOf(" ");
+                                    if (spaceIndex >= 0)
+                                    {
+                                        string opCode = trimLine.Substring(0, spaceIndex).Trim();
+                                        if(opCode == "invoke-direct" || opCode == "invoke-virtual")
+                                        {
+                                            string objectUsed = trimLine.Substring(spaceIndex);
+                                            if(objectUsed.Contains(objectType))
+                                            {
+                                                // Get all the registers used in the method, but only once for performance sake.
+                                                if (usedRegisters == null)
+                                                {
+                                                    usedRegisters = new List<string>();
+                                                    foreach (string registerLine in element.GetLines())
+                                                    {
+                                                        string registerTrimLine = registerLine.Trim();
+                                                        if (registerTrimLine.Length > 0 && registerTrimLine[0] != '.')
+                                                        {
+                                                            int registerSpaceIndex = registerTrimLine.IndexOf(" ");
+                                                            if (registerSpaceIndex >= 0)
+                                                            {
+                                                                string register = registerTrimLine.Substring(registerSpaceIndex).Trim();
+                                                                int registerIndex = register.IndexOf(" ");
+                                                                if (registerIndex >= 0)
+                                                                {
+                                                                    register = register.Substring(0, register.IndexOf(" "));
+                                                                    register = RemoveSpecialCharacters(register);
+                                                                    usedRegisters.Add(register);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                string? availableRegister = possibleRegisters.Find(x => !usedRegisters.Contains(x));
 
-                                if (lineType == ".end" && newLines)
-                                {
-                                    toWrite += line + "\n\n";
-                                    lineCount += 1;
-                                }
-                                else if (lineType != ".end" && (index < 0 || lineTypes[index] != lineType))
-                                {
-                                    newLines = true;
-                                    toWrite += line + "\n\n";
-                                    lineCount += 1;
-                                }
-                                else
-                                {
-                                    newLines = false;
+                                                string? localsLine = element.GetLines().Find(x => x.Contains(".locals"));
+                                                if (localsLine != null)
+                                                {
+                                                    int localsCount = Convert.ToInt32(localsLine.Trim().Substring(8));
+                                                    localsCount += 1;
+                                                    string newLocalsLine = "    .locals " + localsCount;
+                                                    element.ReplaceLine(localsLine, newLocalsLine);
+                                                }
+
+                                                string getObjectLine = "    sget-object " + availableRegister + ", " + currentObjectType + "->" + staticVarName + ":" + objectType;
+                                                string invokeLine = "    " + opCode + " {" + availableRegister;
+
+                                                string registersUsedStr = objectUsed.Substring(objectUsed.IndexOf("{"), objectUsed.LastIndexOf("}"));
+                                                string[] registersUsed = registersUsedStr.Split(new char[] { ',' });
+                                                if(registersUsed.Length > 1)
+                                                {
+                                                    // Copy registers, except for the first one
+                                                    bool skipRegister = true;
+                                                    foreach(string register in registersUsed)
+                                                    {
+                                                        if(skipRegister)
+                                                        {
+                                                            skipRegister = false;
+                                                            continue;
+                                                        }
+
+                                                        invokeLine += ", " + register;
+                                                    }
+                                                }
+                                                invokeLine += "}, " + objectType + "->";
+
+                                                string functionCalled = objectUsed.Substring(objectUsed.IndexOf("<"));
+                                                invokeLine += functionCalled;
+
+                                                element.ReplaceLines(line, new string[] { getObjectLine, invokeLine });
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                            else if (line[0] == ' ' && newLines)
-                            {
-                                toWrite += line + "\n\n";
-                                lineCount += 1;
-                            }
+
+                            writeToElements.Add(element);
                         }
                     }
 
-                    File.AppendAllText(relativeFile, toWrite);
-
-                    if (lineCount > 0)
+                    foreach(Element element in writeToElements)
                     {
-                        Console.WriteLine();
-                        Console.WriteLine(relativeFile);
-                        Console.WriteLine(lineCount + " lines added! (excluding whitelines)");
+                        //File.WriteAllLines(writeToFilePath, element.GetLines());
                     }
                 }
                 else
                 {
-                    string targetDirectory = relativeFile.Substring(0, relativeFile.LastIndexOf('\\'));
+                    /*string targetDirectory = relativeFile.Substring(0, relativeFile.LastIndexOf('\\'));
                     if (!Directory.Exists(targetDirectory))
                     {
                         Directory.CreateDirectory(targetDirectory);
@@ -191,9 +273,73 @@ namespace SmaliConsolidator
 
                     Console.WriteLine();
                     Console.WriteLine(relativeFile);
-                    Console.WriteLine("File copied!");
+                    Console.WriteLine("File copied!");*/
                 }
             }
+        }
+
+        private static string RemoveSpecialCharacters(string str)
+        {
+            StringBuilder sr = new StringBuilder(str.Length);
+            foreach (char c in str)
+            {
+                if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+                {
+                    sr.Append(c);
+                }
+            }
+            return sr.ToString();
+        }
+
+        private static string GenerateRandomString(int length)
+        {
+            StringBuilder sr = new StringBuilder();
+            Random random = new Random();
+
+            for (int i = 0; i < length; i++)
+            {
+                double flt = random.NextDouble();
+                int shift = Convert.ToInt32(Math.Floor(25 * flt));
+                char letter = Convert.ToChar(shift + 65);
+                sr.Append(letter);
+            }
+
+            return sr.ToString();
+        }
+
+        private static List<Element> GetElementsFromFile(string filePath)
+        {
+            List<Element> returnList = new List<Element>();
+            Element? addElement = null;
+            foreach (string line in File.ReadLines(filePath))
+            {
+                if (line.Length > 0)
+                {
+                    if (line[0] == '.' && !line.Contains(".end"))
+                    {
+                        addElement = new Element(line);
+                        returnList.Add(addElement);
+                    }
+                    else if (addElement != null && line[0] != '#')
+                    {
+                        addElement.AddLine(line);
+                    }
+                }
+            }
+
+            return returnList;
+        }
+
+        private static List<string> GetVariableNamesFromElements(List<Element> elements)
+        {
+            List<string> returnList = new List<string>();
+            foreach (Element fieldEle in elements.FindAll(x => x.Type == "field"))
+            {
+                string identifier = fieldEle.Identifier;
+                string varName = identifier.Substring(0, identifier.IndexOf(':'));
+                returnList.Add(varName);
+            }
+            return returnList;
         }
     }
 }
