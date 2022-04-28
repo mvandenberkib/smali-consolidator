@@ -140,28 +140,41 @@ namespace SmaliConsolidator
                         Element? classElement = writeToElements.Find(x => x.Type == "class");
                         if (classElement != null)
                         {
-                            // TODO - There is this weirdness here
-                            // Normally the new-instance has to first get its <init> called before being sput-object into a variable
-                            // However, <init> is often called within functions
-                            // Add the <init> here in the <clinit>, and remove any lines that call <init> in a later function on the static variable
+                            // TODO - One more problem with the <init>
+                            // Some <init> functions have an ObjectType defined that it returns. Some don't
+                            // Possible fixes:
+                            // - Go to the actual file of the class and check the <init> function there
+                            // - Look for the similar <init> in the same file (PICK THIS ONE)
+                            // It is always because another type is returned than the actual type (like MyRepository returning an Executor)
 
                             currentObjectType = classElement.Identifier.Trim();
                             if (clinit == null)
                             {
-                                Element newClinit = new Element(".method static constructor <clinit>()V");
-                                newClinit.AddLine("    .locals 1");
-                                newClinit.AddLine("    new-instance v0, " + objectType);
-                                newClinit.AddLine("    sput-object v0, " + currentObjectType + "->" + staticVarName + ":" + objectType);
-                                newClinit.AddLine(".end method");
-                                writeToElements.Add(newClinit);
+                                clinit = new Element(".method static constructor <clinit>()V");
+                                clinit.AddLine("    .locals 1");
+                                clinit.AddLine("    new-instance v0, " + objectType);
+                                clinit.AddLine("    invoke-direct {v0}, " + objectType + "-><init>()V");
+                                clinit.AddLine("    sput-object v0, " + currentObjectType + "->" + staticVarName + ":" + objectType);
+                                clinit.AddLine(".end method");
                             }
                             else
                             {
                                 // TODO - Change already existing .locals here
+                                string? localsLine = clinit.GetLines().Find(x => x.Contains(".locals"));
+                                if(localsLine != null)
+                                {
+                                    int localsCount = Convert.ToInt32(localsLine.Trim().Substring(8));
+                                    localsCount += 1;
+                                    string newLocalsLine = "    .locals " + localsCount;
+                                    clinit.ReplaceLine(localsLine, newLocalsLine);
+                                }
+
                                 clinit.AddLine("    new-instance v0, " + objectType);
+                                clinit.AddLine("    invoke-direct {v0}, " + objectType + "-><init>()V");
                                 clinit.AddLine("    sput-object v0, " + currentObjectType + "->" + staticVarName + ":" + objectType);
-                                writeToElements.Add(clinit);
                             }
+
+                            writeToElements.Add(clinit);
                         }
                     }
 
@@ -185,6 +198,8 @@ namespace SmaliConsolidator
                                             string objectUsed = trimLine.Substring(spaceIndex);
                                             if(objectUsed.Contains(objectType))
                                             {
+                                                // TODO - Check if the function is <init. If it is, just remove it and don't replace. The <init> now exists in the <clinit> already
+
                                                 // Get all the registers used in the method, but only once for performance sake.
                                                 if (usedRegisters == null)
                                                 {
