@@ -57,6 +57,11 @@ namespace SmaliConsolidator
             }
         }
 
+        public void RemoveLine(string line)
+        {
+            lines.Remove(line);
+        }
+
         public List<string> GetLines()
         {
             return new List<string>(lines);
